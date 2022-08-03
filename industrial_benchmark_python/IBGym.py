@@ -25,8 +25,11 @@ SOFTWARE.
 """
 
 import gym
+from gym.utils.step_api_compatibility import step_api_compatibility
 import numpy as np
 from collections import OrderedDict
+from typing import Optional
+from itertools import product
 
 from industrial_benchmark_python.IDS import IDS
 
@@ -35,8 +38,11 @@ class IBGym(gym.Env):
     """
     OpenAI Gym Wrapper for the industrial benchmark
     """
+
+    metadata = {'render_modes': ['human'], 'render_fps': 4}
+
     def __init__(self, setpoint, reward_type="classic", action_type="continuous", observation_type="classic",
-                 reset_after_timesteps=1000, init_seed=None, n_past_timesteps=30):
+                 reset_after_timesteps=1000, init_seed=None, n_past_timesteps=30, new_step_api: bool = False):
         """
         Initializes the underlying environment, seeds numpy and initializes action / observation spaces
         as well as other necessary variables
@@ -47,14 +53,17 @@ class IBGym(gym.Env):
         :param reset_after_timesteps: how many timesteps can the environment run without resetting
         :param init_seed: seed for numpy to make environment behavior reproducible
         :param n_past_timesteps: if observation type is include_past, this determines how many state frames are used
+        :param new_step_api: if true uses new step api, which distinguishes between termination and truncation,
+                             otherwise the old api interface is used
         """
+
+        self.new_step_api = new_step_api
 
         # IB environment parameter
         self.setpoint = setpoint
 
         # initial seeding
         self.init_seed = init_seed
-        np.random.seed(self.init_seed)
 
         # Used to determine whether to return the absolute value or the relative change in the cost function
         self.reward_function = reward_type
@@ -74,7 +83,8 @@ class IBGym(gym.Env):
         self.delta_reward = None  # alternative reward, showing how much the actual reward changed
         self.smoothed_reward = None  # smoothed reward function following a convex combination of old and new reward
         self.env_steps = None  # how many steps have already been performed in the environment
-        self.done = None  # is the trajectory finished
+        self.terminated = None  # is the trajectory finished
+        self.truncated = None  # is the trajectory finished because of truncation
         self.last_action = None  # contains the action taken in the last step
         self.observation = None  # contains the current observation
 
@@ -83,34 +93,34 @@ class IBGym(gym.Env):
             self.action_space = gym.spaces.Discrete(27)
 
             # A list of all possible discretized actions
-            self.env_action = []
-            for v in [-1, 0, 1]:
-                for g in [-1, 0, 1]:
-                    for s in [-1, 0, 1]:
-                        self.env_action.append([v, g, s])
+            self.env_action = [[v, g, s] for v, g, s in product([-1, 0, 1], [-1, 0, 1], [-1, 0, 1])]
 
         elif self.action_type == 'continuous':  # Continuous action space for each steering [-1,1]
-            self.action_space = gym.spaces.Box(np.array([-1, -1, -1]), np.array([+1, +1, +1]))
+            self.action_space = gym.spaces.Box(
+                np.array([-1, -1, -1], dtype=np.float64),
+                np.array([+1, +1, +1], dtype=np.float64),
+                dtype=np.float64
+            )
 
         else:
             raise ValueError('Invalid action_type. action_space can either be "discrete" or "continuous"')
 
         # Defining the observation space -> single frame: [setpoint, velocity, gain, shift, fatigue, consumption]
-        single_low = np.array([0, 0, 0, 0, 0, 0])
-        single_high = np.array([100, 100, 100, 100, 1000, 1000])
+        single_low = np.array([0, 0, 0, 0, 0, 0], dtype=np.float64)
+        single_high = np.array([100, 100, 100, 100, 1000, 1000], dtype=np.float64)
 
         if self.observation_type == "classic":  # classic only has the current state frame
-            self.observation_space = gym.spaces.Box(low=single_low, high=single_high)
+            self.observation_space = gym.spaces.Box(low=single_low, high=single_high, dtype=np.float64)
 
         elif self.observation_type == "include_past":  # time embedding: state contains also past N state frames
-            low = np.hstack([single_low] * self.n_past_timesteps)
-            high = np.hstack([single_high] * self.n_past_timesteps)
-            self.observation_space = gym.spaces.Box(low=low, high=high)
+            low = np.full([self.n_past_timesteps], fill_value=single_low)
+            high = np.full([self.n_past_timesteps], fill_value=single_high)
+            self.observation_space = gym.spaces.Box(low=low, high=high, dtype=np.float64)
 
         else:
             raise ValueError('Invalid observation_type. observation_type can either be "classic" or "include_past"')
 
-        self.reset()
+        self.reset(seed=init_seed)
 
     def step(self, action):
         """
@@ -119,8 +129,8 @@ class IBGym(gym.Env):
         :return: the new observation
         """
 
-        # when the done flag has been set and the user still calls step, we want to at least reset the environment
-        if self.done:
+        # when the terminated or truncated flag has been set and the user still calls step, we want to at least reset the environment
+        if self.terminated or self.truncated:
             self.reset()
 
         # keep the current action around for potential rendering
@@ -146,7 +156,7 @@ class IBGym(gym.Env):
         # Stopping condition
         self.env_steps += 1
         if self.env_steps >= self.reset_after_timesteps:
-            self.done = True
+            self.truncated = True
 
         # Two reward functions are available:
         # 'classic' which returns the original cost and
@@ -159,17 +169,22 @@ class IBGym(gym.Env):
             raise ValueError('Invalid reward function specification. "classic" for the original cost function'
                              ' or "delta" for the change in the cost fucntion between steps.')
 
-        self.info = self._markovian_state()  # entire markov state - not all info is visible in observations
-        return return_observation, return_reward, self.done, self.info
+        # entire markov state - not all info is visible in observations
+        self.info = self._markovian_state()
+        return step_api_compatibility((return_observation, return_reward, self.terminated, self.truncated, self.info), new_step_api=self.new_step_api, is_vector_env=False)
 
-    def reset(self):
+    def reset(self, seed: Optional[int] = None, return_info: bool = False, options: Optional[dict] = None):
         """
         resets environment
         :return: first observation of fresh environment
         """
+        super().reset(seed=seed)
 
         # ensure reproducibility, but still use different env / seed on every reset
-        self.IB = IDS(self.setpoint, inital_seed=self.init_seed)
+        if seed is not None:
+            np.random.seed(seed)
+        self.IB = IDS(self.setpoint, inital_seed=seed or self.init_seed)
+        # new seed for next reset
         self.init_seed = np.random.randint(0, 100000)
 
         # if multiple timesteps in a single observation (time embedding), need list
@@ -195,16 +210,20 @@ class IBGym(gym.Env):
         self.env_steps = 0
 
         # whether or not the trajectory has ended
-        self.done = False
+        self.terminated = False
+        self.truncated = False
 
-        return return_observation
+        if return_info:
+            return return_observation, {}
+        else:
+            return return_observation
 
     def render(self, mode='human'):
         """
         prints the current reward, state, and last action taken
         :param mode: not used, needed to overwrite the abstract method though
         """
-
+        assert mode in self.metadata['render_modes']
         print('Reward:', self.reward, 'State (v,g,s):', self.IB.visibleState()[1:4], 'Action: ', self.last_action)
 
     def _update_observation(self):
